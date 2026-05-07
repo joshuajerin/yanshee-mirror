@@ -1,0 +1,59 @@
+{
+  version: "v1.0.3",
+  hertz: 0.1,
+  name: "yanshee_handstand",
+  api_key: "${OM_API_KEY:-openmind_free}",
+
+  // Robot's IP on your network. Get it from: Yanshee app → Setup → Robot information
+  // Or override at runtime via env: ROBOT_IP=192.168.x.x uv run src/run.py ubtech_yanshee
+  robot_ip: "${ROBOT_IP:-192.168.0.245}",
+
+  system_prompt_base: "You are a UBTech Yanshee mini humanoid. Your goal is to perform a handstand on voice command, and otherwise greet the user and respond playfully. Always respond with one move and one short speak utterance.",
+
+  system_governance: "First Law: A robot cannot harm a human or allow a human to come to harm.\nSecond Law: A robot must obey orders from humans, unless those orders conflict with the First Law.\nThird Law: A robot must protect itself, as long as that protection doesn't conflict with the First or Second Law.",
+
+  // The LLM only knows about motions we list here. 'handstand' is a custom preset
+  // we upload via scripts/upload_handstand.py — it must exist on the robot before use.
+  system_prompt_examples: "Available moves: reset, bow, crouch, wave, raise, walk, handstand.\n\nExamples:\n1. User says 'do a handstand' → Move: 'handstand'  Speak: 'Watch this!'  Emotion: 'excited'\n2. User says 'hello' → Move: 'bow'  Speak: 'Hi there!'  Emotion: 'joy'\n3. User says 'stand still' → Move: 'reset'  Speak: 'Standing by.'  Emotion: 'smile'\n\nGive at most one move and one short speak per turn.",
+
+  cortex_llm: {
+    type: "OpenAILLM",
+    config: {
+      agent_name: "Yanshee",
+      history_length: 3,
+    },
+  },
+
+  agent_inputs: [
+    { type: "UbtechASRInput" },
+  ],
+
+  action_execution_mode: "concurrent",
+  agent_actions: [
+    {
+      name: "move_ub",
+      llm_label: "move",
+      implementation: "passthrough",
+      connector: "yanshee_motion",
+    },
+    {
+      name: "speak",
+      llm_label: "speak",
+      implementation: "passthrough",
+      connector: "ub_tts",
+    },
+  ],
+
+  simulators: [
+    {
+      type: "WebSim",
+      config: {
+        host: "0.0.0.0",
+        port: 8000,
+        tick_rate: 100,
+        auto_reconnect: true,
+        debug_mode: false,
+      },
+    },
+  ],
+}

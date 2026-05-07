@@ -1,0 +1,17 @@
+.env
+.env.local
+*.log
+__pycache__/
+.venv/
+node_modules/
+.DS_Store
+
+# MediaPipe pose model (5MB binary, fetched at setup time)
+models/
+
+# Editor / tooling
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.idea/
+.vscode/
