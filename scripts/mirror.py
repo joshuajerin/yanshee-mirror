@@ -31,6 +31,7 @@ import os
 import sys
 import time
 import urllib.request
+import threading
 from typing import Dict, List, Optional, Tuple
 
 # Servo safe ranges (arms + neck only — we never touch legs).
@@ -57,9 +58,9 @@ SERVO_DIR: Dict[str, int] = {
     "LeftShoulderRoll":  +1,
     "LeftShoulderFlex":  +1,
     "LeftElbowFlex":     +1,
-    "RightShoulderRoll": +1,
-    "RightShoulderFlex": +1,
-    "RightElbowFlex":    +1,
+    "RightShoulderRoll": -1,
+    "RightShoulderFlex": -1,
+    "RightElbowFlex":    -1,
 }
 
 # MediaPipe Pose landmark indices (33 body landmarks).
@@ -142,12 +143,17 @@ def open_stream(ip: str, resolution: str = "640x480") -> None:
         raise RuntimeError(f"open_vision_stream failed: {res}")
 
 
-def take_photo(ip: str, resolution: str = "640x480") -> bytes:
+def take_photo(ip: str, resolution: str = "320x240") -> bytes:
     res = _post(ip, "/visions/photos", {"resolution": resolution})
     if res.get("code") != 0:
         raise RuntimeError(f"take_vision_photo failed: {res}")
     name = res["data"]["name"]
-    return _get_bytes(f"http://{ip}:9090/v1/visions/photos/{name}", timeout=8)
+    # YanAPI uses ?body=<name> query string, not a path component.
+    import urllib.parse as up
+    return _get_bytes(
+        f"http://{ip}:9090/v1/visions/photos?body={up.quote(name)}",
+        timeout=8,
+    )
 
 
 def battery_pct(ip: str) -> Optional[int]:
@@ -326,16 +332,56 @@ def _decode_jpeg(buf: bytes):
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
-def _make_pose_detector(model_path: str):
+class LatestFrame:
+    """Background reader that keeps only the most recent frame from a cv2 stream.
+
+    OpenCV's HTTP/MJPEG backend buffers frames internally. If we don't drain
+    fast enough, cap.read() returns stale frames. This thread runs read() in a
+    tight loop and overwrites a single slot — readers always get the freshest.
+    """
+
+    def __init__(self, cap) -> None:
+        self.cap = cap
+        self._frame = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self) -> "LatestFrame":
+        self._thread.start()
+        return self
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            ok, frame = self.cap.read()
+            if not ok:
+                time.sleep(0.05)
+                continue
+            with self._lock:
+                self._frame = frame
+
+    def get(self):
+        with self._lock:
+            return self._frame
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.5)
+
+
+def _make_pose_detector(model_path: str, photo_mode: bool):
+    """photo_mode=True uses IMAGE running mode (independent frames),
+    False uses VIDEO mode (temporal tracking across frames)."""
     from mediapipe.tasks import python
     from mediapipe.tasks.python import vision
+    rm = vision.RunningMode.IMAGE if photo_mode else vision.RunningMode.VIDEO
     options = vision.PoseLandmarkerOptions(
         base_options=python.BaseOptions(model_asset_path=model_path),
-        running_mode=vision.RunningMode.VIDEO,
+        running_mode=rm,
         num_poses=1,
-        min_pose_detection_confidence=0.5,
-        min_pose_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_pose_detection_confidence=0.55,
+        min_pose_presence_confidence=0.55,
+        min_tracking_confidence=0.55,
     )
     return vision.PoseLandmarker.create_from_options(options)
 
@@ -349,7 +395,7 @@ def _loop(cap, ip: str, args, model_path: str, photo_mode: bool, source_label: s
     send_angles(ip, ARM_NEUTRAL, runtime_ms=1500)
     time.sleep(1.6)
 
-    detector = _make_pose_detector(model_path)
+    detector = _make_pose_detector(model_path, photo_mode=photo_mode)
     smoother = EMA(alpha=args.smoothing)
     period = 1.0 / args.rate
     last_send = 0.0
@@ -363,8 +409,23 @@ def _loop(cap, ip: str, args, model_path: str, photo_mode: bool, source_label: s
     last_battery_check = time.time()
     t0_ms = int(time.time() * 1000)
 
+    # Stream mode: spawn a background reader so we always work on the freshest frame.
+    grabber: Optional[LatestFrame] = None
+    if not photo_mode and cap is not None:
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        grabber = LatestFrame(cap).start()
+        # Wait briefly for the first frame.
+        for _ in range(40):
+            if grabber.get() is not None:
+                break
+            time.sleep(0.05)
+
     print("running. q=quit, p/space=pause, r=Reset preset")
     frame = None
+    frame_is_new = False  # photo-mode: only run detection on freshly fetched frames
     try:
         while True:
             now = time.time()
@@ -373,6 +434,7 @@ def _loop(cap, ip: str, args, model_path: str, photo_mode: bool, source_label: s
                     try:
                         frame = _decode_jpeg(take_photo(ip))
                         last_photo = now
+                        frame_is_new = True
                     except Exception as e:
                         print(f"[photo err] {e}", file=sys.stderr)
                         time.sleep(0.5)
@@ -382,36 +444,46 @@ def _loop(cap, ip: str, args, model_path: str, photo_mode: bool, source_label: s
                     if frame is None:
                         continue
             else:
-                ok, frame = cap.read()
-                if not ok or frame is None:
-                    print("camera read failed; reconnecting in 1s")
-                    time.sleep(1.0)
-                    try:
-                        cap.release()
-                        open_stream(ip)
-                        cap = cv2.VideoCapture(f"http://{ip}:8000/stream.mjpg")
-                    except Exception as e:
-                        print(f"[reopen err] {e}", file=sys.stderr)
+                # Always pull the latest frame from the background grabber.
+                latest = grabber.get() if grabber else None
+                if latest is None:
+                    time.sleep(0.02)
                     continue
-
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            ts_ms = int(time.time() * 1000) - t0_ms
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result = detector.detect_for_video(mp_image, ts_ms)
+                frame = latest.copy()
 
             target = None
-            if result.pose_landmarks:
-                lm = result.pose_landmarks[0]
-                target = map_pose_to_servos(lm, smoother, scale=args.scale)
-                if not args.no_display:
-                    _draw_skeleton(frame, lm)
+            should_detect = (not photo_mode) or frame_is_new
+            if should_detect:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                if photo_mode:
+                    result = detector.detect(mp_image)
+                else:
+                    ts_ms = int(time.time() * 1000) - t0_ms
+                    result = detector.detect_for_video(mp_image, ts_ms)
+                if result.pose_landmarks:
+                    lm = result.pose_landmarks[0]
+                    target = map_pose_to_servos(lm, smoother, scale=args.scale)
+                    if not args.no_display:
+                        _draw_skeleton(frame, lm)
 
-            if target and not paused and (now - last_send) >= period:
-                send_angles(ip, target, runtime_ms=int(period * 1000 * 1.4))
+            send_now = (
+                target is not None and not paused
+                and (frame_is_new if photo_mode else (now - last_send) >= period)
+            )
+            if send_now:
+                # Yanshee servo runtime is capped at 4000ms.
+                runtime = (
+                    min(4000, int(args.interval * 1000 * 0.85)) if photo_mode
+                    else int(period * 1000 * 1.4)
+                )
+                send_angles(ip, target, runtime_ms=runtime)
                 last_send = now
                 if args.debug_angles:
                     parts = "  ".join(f"{k}={v}" for k, v in target.items())
                     print(f"[{time.strftime('%H:%M:%S')}] {parts}", file=sys.stderr)
+                if photo_mode:
+                    frame_is_new = False  # consume the new frame
 
             fps_count += 1
             if (now - fps_t0) >= 1.0:
@@ -439,6 +511,8 @@ def _loop(cap, ip: str, args, model_path: str, photo_mode: bool, source_label: s
         pass
     finally:
         print("\ncleaning up: arms back to neutral (legs untouched)...")
+        if grabber is not None:
+            grabber.stop()
         if cap is not None:
             cap.release()
         if not args.no_display:

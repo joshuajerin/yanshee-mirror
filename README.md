@@ -121,6 +121,19 @@ Notes:
 - Mirror semantics: your **right** arm raises → robot's **left** arm raises (literal mirror image).
 - Servo angle conventions are empirical — tweak `--scale` if motion under/overshoots.
 
+## Dance Challenge
+
+Say **"robot dance"** to the Yanshee — it performs a 10-second choreography while watching you with its camera, then scores how well you matched it (0–100) and announces the score over TTS.
+
+```bash
+ROBOT_IP=10.73.35.187 .venv/bin/python scripts/dance.py            # listen for voice
+ROBOT_IP=10.73.35.187 .venv/bin/python scripts/dance.py --start    # start immediately
+```
+
+How scoring works: at each of 7 keyframes (every ~1.5s), the robot snaps a photo, runs MediaPipe Pose on it, extracts your shoulder/elbow joint angles, and compares to the expected pose. ≤10° off = 100% per joint, decaying to 0% by 90° off. Final score = average across all keyframes.
+
+Stop `mirror.py` first — both scripts compete for the same MJPEG stream.
+
 ## Quick reference: shell helpers
 
 ```bash
